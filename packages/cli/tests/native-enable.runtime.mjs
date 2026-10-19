@@ -13,7 +13,7 @@ import { assertHidesChildWindows, assertHidesChildWindowsPython } from "./harnes
 
 const cli = join(dirname(fileURLToPath(import.meta.url)), "..", "dist", "index.js");
 
-function fixture({ opencodeVersion = "opencode 1.0.0" } = {}) {
+function fixture({ opencodeVersion = "opencode 1.0.0", opencode2Version = null } = {}) {
   const home = mkdtempSync(join(tmpdir(), "cave-native-enable-"));
   const bin = join(home, "bin");
   mkdirSync(bin, { recursive: true });
@@ -21,6 +21,11 @@ function fixture({ opencodeVersion = "opencode 1.0.0" } = {}) {
     writeFileSync(join(bin, agent), `#!/bin/sh\nif [ "$1" = "--version" ]; then echo '${agent} 1.0.0'; fi\n`, { mode: 0o755 });
   }
   writeFileSync(join(bin, "opencode"), `#!/bin/sh\nif [ "$1" = "--version" ]; then echo '${opencodeVersion}'; fi\n`, { mode: 0o755 });
+  // @opencode/cli publishes `opencode` and `opencode2` from one package, so a
+  // host can carry two majors at once — and both read the same plugins dir.
+  if (opencode2Version) {
+    writeFileSync(join(bin, "opencode2"), `#!/bin/sh\nif [ "$1" = "--version" ]; then echo '${opencode2Version}'; fi\n`, { mode: 0o755 });
+  }
   const mcp = join(bin, "caveman-mcp");
   writeFileSync(mcp, `#!/bin/sh
 if [ "$1" = "version" ] && [ "$2" = "--json" ]; then
@@ -2188,6 +2193,85 @@ test("doctor reports opencode degraded after the host upgrades past the installe
 
   assert.equal((await run(["doctor", "opencode", "--fix"], fx.env)).code, 0);
   assert.match(readFileSync(pluginPath, "utf8"), /async setup\(ctx\)/, "--fix regenerates against the new host major");
+  assert.equal(JSON.parse((await run(["doctor", "opencode"], fx.env)).stdout).state, "installed");
+});
+
+// The opencode plugin file is ONE path both majors read, so "which major is
+// this host" is the wrong question whenever two majors are installed. @opencode/cli
+// publishes `opencode` and `opencode2` from the same package, and a 1.x left on
+// PATH for other projects wins the first-found probe: the gate saw major 1,
+// emitted the V1 hook map, and OpenCode 2 rejected it with
+// `PluginModule.LoadError: ... Missing key at ["default"]` (#1316).
+test("enable opencode emits the dual-major plugin when two opencode majors are installed", async () => {
+  const fx = fixture({ opencodeVersion: "opencode 1.19.3", opencode2Version: "opencode 2.0.26" });
+  const configDir = join(fx.home, ".config", "opencode");
+  mkdirSync(configDir, { recursive: true });
+  writeFileSync(join(configDir, "opencode.json"), JSON.stringify({}) + "\n");
+
+  const enabled = await run(["enable", "opencode"], fx.env);
+  assert.equal(enabled.code, 0, enabled.stderr);
+  const pluginPath = join(configDir, "plugins", "caveman-native.js");
+  const plugin = readFileSync(pluginPath, "utf8");
+  // Both entrypoints, because both hosts load this one file.
+  assert.match(plugin, /export const CavemanNative/, "a 1.x host on this machine still needs the V1 hook map");
+  assert.match(plugin, /async setup\(ctx\)/, "the 2.x host needs the V2 setup, or it refuses to load the file");
+  assert.match(plugin, /id: "caveman-native"/, "V2 requires the default export to carry an id");
+  const syntax = spawnSync(process.execPath, ["--check", pluginPath], { encoding: "utf8" });
+  assert.equal(syntax.status, 0, syntax.stderr);
+
+  // A file both majors load is current for this host, so doctor must not call
+  // the install degraded and send the user into a --fix loop.
+  const doctor = await run(["doctor", "opencode"], fx.env);
+  assert.equal(doctor.code, 0, doctor.stderr);
+  assert.equal(JSON.parse(doctor.stdout).state, "installed");
+});
+
+// With only `opencode2` on PATH, binOf fell back to binary_names[0] ("opencode"),
+// which which() could not find — so the host read as binary_not_found and an
+// OpenCode 2-only machine could not be enabled at all.
+test("enable opencode finds a host installed only as opencode2", async () => {
+  const fx = fixture({ opencode2Version: "opencode 2.0.26" });
+  unlinkSync(join(fx.home, "bin", "opencode"));
+  const configDir = join(fx.home, ".config", "opencode");
+  mkdirSync(configDir, { recursive: true });
+  writeFileSync(join(configDir, "opencode.json"), JSON.stringify({}) + "\n");
+
+  const enabled = await run(["enable", "opencode"], fx.env);
+  assert.equal(enabled.code, 0, enabled.stderr);
+  const plugin = readFileSync(join(configDir, "plugins", "caveman-native.js"), "utf8");
+  assert.match(plugin, /async setup\(ctx\)/, "a 2.x-only host gets the V2 plugin");
+  assert.doesNotMatch(plugin, /export const CavemanNative/, "no V1 hook map when no 1.x is installed");
+  assert.equal(JSON.parse((await run(["doctor", "opencode"], fx.env)).stdout).version, "opencode 2.0.26",
+    "the opencode2 bin is the host doctor reports, not a binary_not_found");
+});
+
+// A V1-only install already on disk is NOT current on a machine that also runs
+// 2.x, whichever binary the first-found probe happens to land on — that host
+// refuses to load it. doctor is the documented repair door for this drift.
+test("doctor flags a V1 opencode plugin once a second, 2.x bin appears", async () => {
+  const fx = fixture({ opencodeVersion: "opencode 1.19.3" });
+  const configDir = join(fx.home, ".config", "opencode");
+  mkdirSync(configDir, { recursive: true });
+  writeFileSync(join(configDir, "opencode.json"), JSON.stringify({}) + "\n");
+  assert.equal((await run(["enable", "opencode"], fx.env)).code, 0);
+  const pluginPath = join(configDir, "plugins", "caveman-native.js");
+  assert.match(readFileSync(pluginPath, "utf8"), /export const CavemanNative/, "V1-only host gets the V1 plugin");
+  assert.equal(JSON.parse((await run(["doctor", "opencode"], fx.env)).stdout).state, "installed");
+
+  // The user installs @opencode/cli 2.x beside the 1.x they kept. `opencode`
+  // still answers 1.19.3, so nothing the old single-binary probe looked at moved.
+  writeFileSync(join(fx.home, "bin", "opencode2"),
+    `#!/bin/sh\nif [ "$1" = "--version" ]; then echo 'opencode 2.0.26'; fi\n`, { mode: 0o755 });
+
+  const doctor = await run(["doctor", "opencode"], fx.env);
+  assert.notEqual(doctor.code, 0, "a plugin one installed host cannot load must not report healthy");
+  assert.equal(JSON.parse(doctor.stdout).state, "degraded");
+  assert.equal(JSON.parse(doctor.stdout).components.lifecycle_hooks, false);
+
+  assert.equal((await run(["doctor", "opencode", "--fix"], fx.env)).code, 0);
+  const repaired = readFileSync(pluginPath, "utf8");
+  assert.match(repaired, /export const CavemanNative/, "--fix keeps the 1.x entrypoint that host still needs");
+  assert.match(repaired, /async setup\(ctx\)/, "--fix adds the 2.x entrypoint");
   assert.equal(JSON.parse((await run(["doctor", "opencode"], fx.env)).stdout).state, "installed");
 });
 

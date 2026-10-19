@@ -394,7 +394,8 @@ export const PROFILES: AgentProfile[] = [
     "vendor": "sst",
     "homepage": "https://opencode.ai/docs/config",
     "binary_names": [
-      "opencode"
+      "opencode",
+      "opencode2"
     ],
     "args": [],
     "install": "npm i -g opencode-ai",

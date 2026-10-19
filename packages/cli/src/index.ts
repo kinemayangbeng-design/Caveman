@@ -8597,8 +8597,17 @@ type NativeHostProbe = { binary: string | null; launchable: boolean; version: st
 const nativeHostProbes = new Map<string, NativeHostProbe>();
 
 function nativeHostProbe(agent: AgentProfile): NativeHostProbe {
-  const binary = which(binOf(agent));
-  if (!binary) return { binary: null, launchable: false, version: null, error: "binary_not_found" };
+  return nativeBinaryProbe(binOf(agent))
+    ?? { binary: null, launchable: false, version: null, error: "binary_not_found" };
+}
+
+// One named binary, or null when it is not installed — so a caller that cares
+// about EVERY published name (opencodePluginMajors) can ask per name instead of
+// only about binOf's first hit. Shares the probe cache, keyed on the resolved
+// path, so two names resolving to the same file cost one spawn.
+function nativeBinaryProbe(name: string): NativeHostProbe | null {
+  const binary = which(name);
+  if (!binary) return null;
   let probe = nativeHostProbes.get(binary);
   if (!probe) nativeHostProbes.set(binary, probe = probeNativeHost(binary));
   return probe;
@@ -9002,12 +9011,28 @@ function opencodeNativePluginPath(): string {
   return join(opencodeConfigDir(), "plugins", "caveman-native.js");
 }
 
-function opencodePluginMajor(): number | null {
+// The plugin APIs this machine has to satisfy, ascending and deduplicated.
+//
+// Asking which major "the" host is was the wrong question: the generated plugin
+// lives at ONE path every opencode on the machine reads, and @opencode/cli
+// publishes `opencode` and `opencode2` from the same package, so two majors run
+// side by side routinely. A 1.x kept on PATH for other projects won binOf's
+// first-found probe, the gate read major 1, and OpenCode 2 refused the V1 hook
+// map outright: PluginModule.LoadError, missing "default" (#1316).
+//
+// Empty means no installed binary named a readable version — evidence of
+// neither major, not of absence.
+function opencodePluginMajors(): number[] {
   const profile = AGENTS.find((agent) => agent.id === "opencode");
-  const host = profile ? nativeHostProbe(profile) : null;
-  // A failed probe's text is its error output, not a version.
-  const semver = host?.launchable ? parsedSemver(host.version) : undefined;
-  return semver ? semver[0]! : null;
+  if (!profile) return [];
+  const majors = new Set<number>();
+  for (const name of profile.binary_names) {
+    const probe = nativeBinaryProbe(name);
+    // A failed probe's text is its error output, not a version.
+    const semver = probe?.launchable ? parsedSemver(probe.version) : undefined;
+    if (semver) majors.add(semver[0]!);
+  }
+  return [...majors].sort((a, b) => a - b);
 }
 
 function opencodeNativePluginSource(): string {
@@ -9021,10 +9046,13 @@ function opencodeNativePluginSource(): string {
   // V2 { id, setup } beside it. 1.x also calls setup, with a context that has
   // no session or event API, so setup returns there. Checked against real
   // OpenCode 1.18.35 and 2.0.22; 1.0-1.3 call every export and cannot load it.
-  const major = opencodePluginMajor();
-  if (major === null) return opencodeNativePluginSourceBoth();
-  if (major < 2) return opencodeNativePluginSourceV1();
-  return opencodeNativePluginSourceV2();
+  //
+  // Two installed majors take that same file, for the same reason: they share
+  // this one plugins directory, so a file pinned to either API is one the other
+  // host refuses to load (#1316).
+  const majors = opencodePluginMajors();
+  if (majors.length !== 1) return opencodeNativePluginSourceBoth();
+  return majors[0]! < 2 ? opencodeNativePluginSourceV1() : opencodeNativePluginSourceV2();
 }
 
 function opencodeNativePluginSourceBoth(): string {
@@ -11414,16 +11442,23 @@ function nativeIntegrationStatus(agent: NativeAgent, { probe = true }: { probe?:
   // An unreadable version cannot vouch for a single-API file (an old V1 install
   // on a 2.x host whose probe times out); repair rewrites it as the file both
   // majors load, which reads current whatever the version.
+  //
+  // Neither can ONE readable version when the machine has two of them: the same
+  // drift arrives sideways when a second bin shows up rather than when the first
+  // one upgrades (`opencode` stays 1.19.3, `opencode2` is new, and the shared
+  // plugins dir now has a host that refuses the installed file — #1316). So the
+  // question is the full set of installed majors, exactly as it is for emission.
   const opencodePluginApiCurrent = agent !== "opencode" || (() => {
     const operation = journal?.operations.find((item) => item.kind === "opencode-plugin");
     const current = operation ? fileBytes(operation.file)?.toString("utf8") : null;
     if (!current) return true;
     const installedV2 = current.includes("async setup(ctx)");
     const installedV1 = current.includes("export const CavemanNative");
+    // Both markers (the dual file) or neither: nothing is pinned to one API.
     if (installedV1 === installedV2) return true;
-    const semver = host.launchable ? parsedSemver(host.version) : undefined;
-    if (!semver) return false;
-    return (semver[0]! >= 2) === installedV2;
+    const majors = opencodePluginMajors();
+    if (majors.length !== 1) return false;
+    return (majors[0]! >= 2) === installedV2;
   })();
   const routeHealthy = ownedHealthy && (agent === "opencode"
     ? Object.entries(opencodeNativeRoutes(gatewayURL())).every(([providerID, route]) => (routeOperation?.owned?.routes as Record<string, unknown> | undefined)?.[providerID] === route)

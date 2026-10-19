@@ -466,6 +466,23 @@ def verify_powershell_static() -> None:
     )
     ensure("[CAVEMAN" in statusline_text, "caveman-statusline.ps1 missing badge output")
 
+    # uninstall.ps1's .bak probe deliberately runs a node that exits 1 whenever
+    # the backup holds the comments the rewrite dropped, and it does not abort:
+    # a non-zero there is the answer, not an error. `powershell.exe -File` on
+    # Windows PowerShell 5.1 -- still the default shell on Windows -- ends a
+    # script with the last native command's exit code, so a clean uninstall of a
+    # JSONC settings.json reported failure. Clearing $LASTEXITCODE does not fix
+    # it: that assignment updates the variable, not the engine state the process
+    # exit code comes from. Only an explicit `exit 0` does. pwsh 7 exits 0 either
+    # way, and every .ps1 case skips on the POSIX runners, so this grep is the
+    # only guard here.
+    ensure(
+        uninstall_text.rstrip().endswith("exit 0"),
+        "uninstall.ps1 must end with an explicit `exit 0`: it leaves a deliberate "
+        "non-zero native exit code behind, which Windows PowerShell 5.1 returns as "
+        "the script's status",
+    )
+
     # Parity anchors between the two statusline ports and the JS source of
     # truth. There is no PowerShell behavioral test on the POSIX runners, so
     # these greps are the only thing standing between a bash-only fix and a
